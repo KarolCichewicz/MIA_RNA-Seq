@@ -1,0 +1,1283 @@
+---
+title: MIA RNA-Seq analysis
+author: Karol Cichewicz, Iva Zdilar, Alex Nord
+output:
+ html_document:
+    css: style.css
+    df_print: default
+    theme: united
+    toc: yes
+    toc_depth: 4
+    code_folding: "hide"
+urlcolor: blue
+---
+
+```{r, message=FALSE, error=FALSE, echo=TRUE,cache=FALSE}
+
+# File compilation and preprocessing
+# Loads all necessary packages
+library(sva)
+library(RUVnormalize)
+library(pheatmap)
+library(edgeR)
+library(GenomicFeatures)
+library(mclust)
+library(parallel)
+library(ggplot2)
+library(reshape2)
+library(dplyr)
+library(data.table)
+library(DT)
+library(RColorBrewer)
+library(knitr)
+library(ggrepel)
+library(gridExtra)
+library(grid)
+library(plyr)
+library(plotly)
+```
+
+
+```{r, message=FALSE, error=FALSE, echo=TRUE, cache=TRUE}
+###Generate mm9 list of exon sizes 
+# Method description at: https://www.biostars.org/p/83901/
+
+txdb <- makeTxDbFromGFF("C:/Users/Karol/Desktop/ASN_lab/Genomes/Mus_musculus/UCSC/mm9/Annotation/genes.gtf",format="gtf")
+exons.list.per.gene <- exonsBy(txdb,by="gene")
+
+#I paralelized this increasing the speed of the process >2x on a 4-core (logical) machine. 
+#Use mclapply instead of parLapply if you use a Mac.
+cl <- makeCluster(detectCores())
+exonic.gene.sizes <- parallel::parLapply(cl, exons.list.per.gene,function(x){sum(width(reduce(x)))})
+stopCluster(cl)
+
+```
+
+
+```{r,echo=TRUE, message=TRUE, error=T, cache=TRUE}
+###Reading and merging some of the count tables
+##Merges data files
+#These files already exist so nothing has to run in this chunk of code
+
+#These files contain P0 data
+setwd("G:/Team Drives/Nord Lab - Data/MIAx00/RNAseq/Results")
+if (file.exists("Project_Nord_MERGED_HS674_mm9-50_fC0_UN.txt")==F) {
+  count.1 <- read.table("Project_Nord_L3_HS674_mm9-50_fC0_UN.txt", sep="\t", header=T, as.is=T, stringsAsFactors=F)
+  count.2 <- read.table("Project_Nord_L7_HS674_mm9-50_fC0_UN.txt", sep="\t", header=T, as.is=T, stringsAsFactors=F)
+  count.3 <- read.table("Project_ANIZ_L6_H674P_Zdilar_mm9-50_fC0_UN.out", sep="\t", header=T, as.is=T, stringsAsFactors=F)
+  count.3 <- count.3[,c(1,4,2,3,5:ncol(count.3))]
+  count.final <- count.1[,1:12]
+  count.final[,1] <- count.1[,1]
+  for (index in 2:12) {
+    count.final[,index] <- count.1[,index] + count.2[,index] + count.3[,index]
+  }
+  colnames(count.final) <- c("Gene", "MIA_P0_1.S44.L006", "MIA_P0_10.S53.L006", "MIA_P0_11.S54.L006", "MIA_P0_2.S45.L006", "MIA_P0_3.S46.L006", "MIA_P0_4.S47.L006", "MIA_P0_5.S48.L006","MIA_P0_6.S49.L006", "MIA_P0_7.S50.L006", "MIA_P0_8.S51.L006", "MIA_P0_9.S52.L006")
+ #write.table(count.final, "Project_Nord_MERGED_HS674_mm9-50_fC0_UN.txt", sep="\t", col.names=T, row.names=F, quote=F)
+}
+
+# This is processing E12.5 and E17.5 data
+# Merge count data from split row
+# Renames columns in the count matrix
+setwd("G:/Team Drives/Nord Lab - Data/MIAx00/RNAseq/Results")
+if (file.exists("ALL_MATRIX_RENAMED.txt")==F) {
+  count.1 <- read.table("ALL_MATRIX.txt", sep="\t", header=T, as.is=T, stringsAsFactors=F)
+  update.col.names <- colnames(count.1)
+  update.col.names <- gsub("X", "", update.col.names)
+  sample.id <- strsplit(update.col.names, "_")
+  e12.5.samples <- c("1623.1",
+                     "1623.2",
+                     "1635.4",
+                     "1635.5",
+                     "1644.3",
+                     "1644.4",
+                     "1646.3",
+                     "1646.4",
+                     "1819.2",
+                     "1819.4",
+                     "1819.5",
+                     "1858.1")
+  e17.5.samples <- c("1631.1",
+                     "1631.2",
+                     "1641.4",
+                     "1641.5",
+                     "1712.1",
+                     "1712.3",
+                     "1823.1",
+                     "1823.2",
+                     "1826.3",
+                     "1826.4",
+                     "1842.11",
+                     "1842.1")
+  
+  for (index in 1:length(update.col.names)) {
+    if ((strsplit(update.col.names[index], "_")[[1]][1] %in% e12.5.samples) == T) {
+      update.col.names[index] <- gsub("_", "\\.", paste("MIA.e12.5.", gsub("_R1_001", "", update.col.names[index]), sep=""))
+    }
+    if ((strsplit(update.col.names[index], "_")[[1]][1] %in% e17.5.samples) == T) {
+      update.col.names[index] <- gsub("_", "\\.", paste("MIA.e17.5.", gsub("_R1_001", "", update.col.names[index]), sep=""))
+    }
+  }
+
+#Quick sanity check looking at colnames before and after renaming  
+#data.frame(colnames(count.1), update.col.names)  
+    
+  count.final <- count.1
+  colnames(count.final) <- update.col.names
+  count.final <- count.final[,grep("Undetermined", update.col.names, invert = T)] # Removes "Undetermined" samples
+  count.final <- cbind(Gene=rownames(count.final), count.final)
+  #write.table(count.final, "ALL_MATRIX_RENAMED.txt", sep="\t", col.names=T, row.names=F, quote=F)
+}
+```
+
+
+```{r, message=FALSE, error=FALSE, echo=TRUE, cache=TRUE}
+### Organizing sample.info experiment metadata
+# Organizing sample.info
+sample.info <- read.table("MIA.RNASeq.SampleInfo.20180710.txt", sep="\t", header=T, as.is=T, stringsAsFactors=F)
+sample.info[,2] <- gsub("_", ".", sample.info[,2])
+sample.info[,2] <- gsub("-", ".", sample.info[,2])
+sample.info[, "CountFile"] <- gsub("ALL_MATRIX.txt", "ALL_MATRIX_RENAMED.txt", sample.info[, "CountFile"])
+sample.info <- sample.info[order(as.character(sample.info[,2])),]
+#This replaces DPC 21 to 19.5. Why??
+sample.info[,"DPC"] <- ifelse(sample.info[,"DPC"]=="21", 19.5,sample.info[,"DPC"])
+```
+
+
+```{r, error=FALSE, message=FALSE, echo=TRUE, cache=TRUE}
+###Reading and merging the remaining count tables - generates exp.data object
+#  load and merge gene count data
+## This is a very clever approach to merging multiple files :)
+
+count.filenames <- unique(sample.info[,"CountFile"])
+for (index in 1:length(count.filenames)) {
+  temp <- read.table(as.character(count.filenames[index]), sep="\t", header=T, as.is=T, stringsAsFactors = F)
+  named.cols <- max(grep("MIA", colnames(temp)))
+  temp <- temp[,1:named.cols]
+  if (index == 1) {
+    exp.data <- temp
+    colnames(exp.data)[1] <- "Gene"
+  } else {
+    split.id <- colnames(temp)[1]
+    exp.data <- merge(exp.data, temp, by.x="Gene", by.y=split.id)
+  }
+}
+
+colnames(exp.data) <- gsub("_", ".", colnames(exp.data))
+colnames(exp.data) <- gsub("-", ".", colnames(exp.data))
+exp.data <- exp.data[,order(colnames(exp.data))]
+rownames(exp.data) <- exp.data[,1]
+exp.data <- exp.data[,2:ncol(exp.data)]
+
+#Dimention of the exp.dataframe
+#dim(exp.data)
+
+#Colnames of the exp.data
+#colnames(exp.data)
+```
+
+### Identification of males/females based on Xist RNA expression
+```{r, error=FALSE, message=FALSE, echo=TRUE, cache=TRUE}
+#I'm just checking if the 1000 counts threshorld for Xist makes sense. It does. 
+
+#Qualifies F or M based on the Xist expression
+sex.by.rna <- c(ifelse(exp.data["Xist",]>1000,"F","M")) #
+
+Xist_exp <- as.data.frame(melt(exp.data["Xist",]))
+Xist_exp <- cbind(Xist_exp, sex.by.rna)
+Xist_exp <- arrange(Xist_exp, value)
+colnames(Xist_exp) <- c("variable", "counts", "sex.by.rna")
+
+ggplot(Xist_exp, aes(x=sex.by.rna, y=counts, colours=sex.by.rna))+
+  geom_point()+
+  geom_boxplot(alpha=0.2)+
+  theme_bw()+
+  labs(title="Xist read counts for calling sex")+
+  theme(plot.title = element_text(size = rel(2), hjust=0.5))
+
+#Number of females by RNA
+#sum(Xist_exp$counts > 1000)
+
+#Number of males by RNA
+#sum(Xist_exp$counts < 1000)
+```
+
+#Sample metadata table
+
+Samples marked as outliers were removed.
+```{r, error=FALSE, message=FALSE, echo=TRUE, cache=TRUE}
+# Identifies outliers
+outlier <- ifelse(sample.info[,"Outlier"]=="1",1,0)         #Samples marked with 1 are Outliers 
+outlier <- ifelse(is.na(sample.info[,"Outlier"]),0,outlier) #
+
+#Preserving data with outliers
+exp.data_w_outliers <- exp.data
+sample.info_w_outliers <- sample.info
+
+# Removes the outliers from the dataset
+exp.data <- exp.data[,which(outlier==0)]                    #Filters exp.data columns(samples) which are not outliers
+sample.info <- sample.info[which(outlier==0),]              #It does the same for the rows of sample info 
+
+# Assigns group values 1 for Saline; 2 for PolyIC, 3 for Inhibitor
+group <- ifelse(sample.info[,"Condition"]=="Saline",1,2)
+group <- ifelse(sample.info[,"Condition"]=="Inhibitor",3,group) #
+#group <- ifelse(sample.info[,"Condition"]=="unknown",4,group)
+group <- factor(group)
+
+# Assigns sex value, 1 for Male, 2 for Female and 3 for unknown.
+# There may be a logical error in this assignment because there are 4 symbols deliminating sex "M" "F" "?" ""
+# Therefore ?" "" get assigned the value of 2. 
+#IMPORTANT: Check if for the DE expression sex is called from the RNA or from this column.
+#ANSWER: No. Sex in the analysis is called from the Xist RNA expression. This sex calling is done just pro forma.
+
+sex <- ifelse(sample.info[,"Sex"]=="M",1,2)            
+sex <- ifelse(sample.info[,"Sex"]=="unknown",3,sex)    
+sex <- factor(sex)
+
+#Adds sex.by.rna and to sample.info. Double check if there wans't an error with assigning sex by RNA into the sample.info metadata.
+sample.info <- data.frame(sample.info, sex_by_rna = sex.by.rna[which(outlier!=1)])
+sample.info <- cbind(sample.info, ExperimentalDesign=paste(sample.info[,"DPC"], sample.info[,"Condition"], sep="_"))
+
+# Writes updated sample.infor and exp.data to files
+#write.table(sample.info, "UpdatedSampleInfo.txt", sep="\t", col.names=T, row.names=F)
+#write.table(cbind(Gene=rownames(exp.data), exp.data), "MIA_GENE_MATRIX.txt", sep="\t", col.names=T, row.names=F)
+
+#Renames columns in sample.info - housekeeping
+info.col.names <- colnames(sample.info)
+sample.info <- sample.info[,c(2,1,3:ncol(sample.info))]
+colnames(sample.info) <- info.col.names
+
+#And confusingly writes another file...
+#write.table(sample.info, "MIA_SAMPLE_INFO.txt", sep="\t", col.names=T, row.names=F, quote=F)
+
+#Writes a sample.infor file lacking the inhibitor and lane 12 samples
+#write.table(sample.info[which(group!=3 & sample.info[,"Lane"]!=12),], "MIA_SAMPLE_INFO_POLYIC.txt", sep="\t", col.names=T, row.names=F, quote=F)
+#write.table(cbind(Gene=rownames(exp.data), exp.data), "MIA_GENE_MATRIX.txt", sep="\t", col.names=T, row.names=F, quote=F)
+
+datatable(sample.info, rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T) )
+
+#knitr::kable(sample.info)
+```
+
+```{r, error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=TRUE}
+###Generates vectors/factors from the outlier-filtered dataset for the analysis
+sex.by.rna <- ifelse(exp.data["Xist",]>1000,"2","1")
+sex.by.rna <- factor(sex.by.rna)
+response <- ifelse(sample.info[,"Response"]=="med",1,2)
+response <- factor(response)
+#unknown.batch <- ifelse(sample.info[,"ControlOutlier"]=="0",1,2)
+#unknown.batch <- factor(unknown.batch)
+lane <- factor(sample.info[,"Lane"])
+dpc <- sample.info[,"DPC"]
+dpc <- ifelse(dpc=="P0", 19.5, dpc)
+dpc <- ifelse(dpc=="21", 19.5, dpc)    # Why??
+dpc <- ifelse(dpc=="e14.5", 14.5, dpc)
+dpc <- ifelse(dpc=="e12.5", 12.5, dpc)
+dpc <- ifelse(dpc=="e17.5", 17.5, dpc)
+dpc <- as.factor(dpc)
+
+rRNA <- exp.data["Rn45s",]/colSums(exp.data) #45S rRNA serves as the precursor for the 18S, 5.8S and 28S rRNA. It's used as a normalization factor
+colnames(exp.data) <- paste(dpc, group, sex.by.rna, response, lane, sample.info[,"Library"], sep="_") #Interesting encoding
+exp.original <- exp.data
+
+# exp.data colnames encoding
+colnames(exp.data) <- paste(dpc, group, sex.by.rna, response, lane, sample.info[,"Library"], sep="_")
+
+```
+
+
+```{r, error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=TRUE}
+### Calculates RPKM values
+# Run PCA and MDA on rpkm.batch instead of exp.data.
+# Generate RPKM table
+
+#gene.lengths <- vector(length=nrow(exp.data))
+#for (index in 1:length(gene.lengths)) {
+#  gene.lengths[index] <- as.numeric(exonic.gene.sizes[rownames(exp.data)[index]])
+#}
+
+# Gene lengths calculated with lapply
+gene.lengths <- as.numeric(lapply(1:nrow(exp.data), function(x) FUN= as.numeric(exonic.gene.sizes[rownames(exp.data)[x]])))
+
+#edgeR settings
+rpkm.data <- rpkm(exp.data, gene.length=gene.lengths, log=T, prior.count=.25)
+
+#Removes batch effect associated with lane of sequencing. "design: optional design matrix relating to treatment conditions to be preserved". I think this is may be incorrect since the exp.data contains raw counts.Run this on rpkm data instead. 
+rpkm.batch <- removeBatchEffect(exp.data, batch=lane, design=cbind(dpc, group, sex.by.rna, response))
+
+#write.table(cbind(Gene=rownames(rpkm.data), rpkm.data), "MIA_RPKM.txt", sep="\t", col.names=T, row.names=F)
+
+#write.table(cbind(Gene=rownames(rpkm.data), rpkm.data[,which(group!=3 & sample.info[,"Lane"]!=12)]), "MIA_POLYIC_RPKM.txt", sep="\t", col.names=T, row.names=F)
+
+#write.table(cbind(Gene=rownames(rpkm.batch), rpkm.batch), "MIA_RPKM_BATCH.txt", sep="\t", col.names=T, row.names=F)
+#write.table(cbind(Gene=rownames(rpkm.batch), rpkm.batch[,which(group!=3 & sample.info[,"Lane"]!=12)]), "MIA_POLYIC_RPKM_BATCH.txt", sep="\t", col.names=T, row.names=F)
+
+```
+
+## ggplot functions plotting RPKM values.
+I removed lane 12, the inhibitor, and all of the outlier samples from these plots.
+RPKM values are corrected for lane batch effect.
+
+```{r, error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=TRUE}
+
+rpkm.data_linear <- rpkm(exp.data, gene.length=gene.lengths, log=F)
+#rpkm data normalized for the batch effect, shouldn't it run on the exp.data instead???
+rpkm.data_linear_batch_corr <- removeBatchEffect(rpkm.data_linear, batch=lane, design=cbind(dpc, group, sex.by.rna, response))
+
+# Removing lane 12 samples and the inhibitor group
+#rpkm.data_linear_clean <- rpkm.data_linear[,which(lane!="12" & group!="3")]
+rpkm.data_linear_batch_corr_clean <- rpkm.data_linear_batch_corr[,which(lane!="12" & group!="3")]
+sample.info_clean <- sample.info[which(lane!="12" & group!="3"),]
+
+
+rpkm_box_plot <- function(x){
+rpkm_test <- as.data.frame(melt(rpkm.data_linear_batch_corr_clean[x,]))
+rpkm_test_w_info <- cbind(rpkm_test, sample.info_clean[,"ExperimentalDesign"])
+rpkm_test_w_info <- cbind(rpkm_test_w_info, as.character(sample.info_clean[,"DPC"]))
+rpkm_test_w_info <- cbind(rpkm_test_w_info, as.character(sample.info_clean[,"Condition"]))
+
+colnames(rpkm_test_w_info) <- c("RPKM", "treatment", "DPC", "Condition")
+
+j_brew_colors <- brewer.pal(n = 8, name = "Paired")[c(6,2)]
+
+ggplot(rpkm_test_w_info, aes(x = DPC, y= RPKM, colour=Condition))+
+  geom_point(size=2)+
+  geom_boxplot(alpha=0, position="identity")+
+  theme_bw()+
+  geom_smooth(method = "loess", se=T, aes(fill=Condition,  group=Condition), size  = 1, alpha=0.1)+
+  theme(axis.text.x=element_text(angle=50, vjust=0.9, hjust=1, size=12, face="bold"))+
+  labs(title= x, x="DPC")+
+  theme(plot.title = element_text(size = rel(2), hjust=0.5))+
+  scale_color_manual(values = j_brew_colors)+
+  scale_fill_manual(values = j_brew_colors)
+  #scale_y_continuous(limits = c(0, max(rpkm_test_w_info$RPKM)))
+}
+
+```
+
+### Vegfa RPKM example
+```{r, error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE}
+
+rpkm_box_plot("Vegfa")
+```
+
+### A set of genes requested by Cesar for Daniel Vogt
+```{r, fig.height = 7, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE}
+genes <- c("Sox6", "Sst", "Prox1", "Sp8", "Mki67")
+
+pl <- lapply(genes, function(x) rpkm_box_plot(x))
+ml <- marrangeGrob(pl, nrow=2, ncol=3, top = "")
+ml
+```
+
+###Genes coding Histone H3
+```{r, fig.height = 20, fig.width = 28, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE}
+
+gtf <- read.table("C:/Users/Karol/Desktop/ASN_lab/Genomes/Mus_musculus/UCSC/mm9/Annotation/genes.gtf", fill = TRUE)
+gene_name_list <- unique(filter(gtf, V12=="gene_name")[,10])
+#This this for troubleshooting/learning regexp glob2rx("Hist?h3*")
+histone_3_genes <- as.character(gene_name_list[which(grepl("^Hist.h3", gene_name_list))])
+histone_3_genes <- sort(c("H3f3a","H3f3b", histone_3_genes))
+histone_3_genes
+
+
+#length(histone_3_genes)
+
+pl <- lapply(histone_3_genes, function(x) rpkm_box_plot(x))
+ml <- marrangeGrob(pl, nrow=3, ncol=5, top = "")
+ml
+```
+
+```{r, fig.height = 14, fig.width = 23, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE}
+
+# Function extracting rpkm data
+
+rpkm_df_extract <- function(x){
+rpkm_test <- as.data.frame(melt(rpkm.data_linear_batch_corr_clean[x,]))
+rpkm_test$gene <- rep(x, nrow(rpkm_test))
+rpkm_test_w_info <- cbind(rpkm_test, sample.info_clean[,"ExperimentalDesign"])
+rpkm_test_w_info <- cbind(rpkm_test_w_info, as.character(sample.info_clean[,"DPC"]))
+rpkm_test_w_info <- cbind(rpkm_test_w_info, as.character(sample.info_clean[,"Condition"]))
+colnames(rpkm_test_w_info) <- c("RPKM","gene", "treatment", "DPC", "Condition")
+rpkm_test_w_info <- rpkm_test_w_info[,c(2,4,5,3,1)]
+rownames(rpkm_test_w_info) <- NULL
+rpkm_test_w_info
+}
+
+#head(rpkm_df_extract("Vegfa"))
+
+#Function generating a dataframe containing multiple extracted rpkm values
+rpkm_df <- function(x){( 
+  d <- lapply(x, function(x) FUN = rbind(rpkm_df_extract(x))))
+  d <- ldply(d, data.frame)
+  d
+  }
+
+histone_3_genes_df <- rpkm_df(histone_3_genes)
+
+#head(histone_3_genes_df)
+  
+# RPKM summary calculation
+  DT <- data.table(histone_3_genes_df)
+  rpkm_summary <- DT[,list(mean_RPKM=as.numeric(mean(na.omit(RPKM))), sd=as.numeric(sd(na.omit(RPKM)))),
+          by=c("gene", "DPC", "Condition", "treatment")]
+
+```
+
+```{r, fig.height = 11, fig.width = 23, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE}
+
+datatable(rpkm_summary, rownames = FALSE, filter="top", options = list(pageLength = 15, scrollY=T) )
+
+Histone_H3_summary_plot <- ggplot(rpkm_summary, aes(x=DPC, y=mean_RPKM, colour=gene, shape=Condition, label=gene))+
+  geom_point(size=5)+
+  geom_errorbar(aes(min=mean_RPKM-sd, max=mean_RPKM+sd))+
+  theme_bw()+
+  geom_text(nudge_x = 0.1)
+
+Histone_H3_summary_plot
+
+#Histone expression doesn't seem to be statistically different between PolyIC and Saline, but H3f3b gene is the dominant isoform expressed.
+```
+
+## Dimensionality reduction plots
+
+Read the figure caption for the information on the lane 12 and inhibitor sample exclusion.
+
+```{r, error=FALSE, warning=FALSE, message=FALSE, cache=FALSE}
+min.cpm.criteria <- 0.1 # really relaxed
+test.data <- exp.data
+#colnames(test.data) <- paste(sample.info$ExperimentalDesign, 1:102, sep = "_")
+test.samples <- 1:nrow(sample.info)
+min.cpm <- min.cpm.criteria
+y <- DGEList(counts=test.data, group=group[test.samples])
+keep <- rowSums(cpm(y)>min.cpm) >=2 #keeps only genes expressed in above min.cpm in at least 2 libraries in each group 
+y <- y[keep, , keep.lib.sizes=FALSE]
+y <- calcNormFactors(y) # Normalizes for RNA composition
+y <- estimateCommonDisp(y) # Estimates common dispersions. Calculates pseudo-counts, a type of normalized counts. Don't misteke them with 0+x type counts from other packages. Also "users are advised not to interpret the psuedo-counts as general-purpose normalized counts".
+y <- estimateTagwiseDisp(y) #Estimates dispersions. Applicable only to experiments with single factor.
+#Alternatively the two commands from above can be replaced with y <- estimateDisp(y)
+
+```
+
+### MDS plot
+```{r, fig.height = 7, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap="Fig. MDS plot excluding the outliers only"}
+#These are some not-so-nice plots using base R Graphics 
+#cols <- colorRampPalette(brewer.pal(10,"Paired"))(length(unique(sample.info$ExperimentalDesign)))
+#plotMDS(y, cex=0.6,labels = sample.info$ExperimentalDesign, xlim=c(-4, 2), ylim=c(-3,3), col=cols)
+
+#colnames(exp.data) <- paste(dpc, group, sex.by.rna, response, lane, sample.info[,"Library"], sep="_")
+#plotMDS(y, xlim=c(-4, 3.5), ylim=c(-3,3), cex=1, col=cols, pch = 16)
+#legend("topright", par(xpd=TRUE), legend=as.character(unique(sample.info$ExperimentalDesign)), col=c(cols), pch = 16, #cex=0.7)
+
+#MDS plot using ggplot.
+
+MDS_data <- plotMDS(y,plot = FALSE)
+MDS_data2 <- data.frame(Leading_logFC_dim_1 = MDS_data$x, Leading_logFC_dim_2=MDS_data$y)
+MDS_data2 <- data.frame(Samples=rownames(MDS_data2), MDS_data2, DPC=as.character(sample.info$DPC), ExperimentalDesign=sample.info$ExperimentalDesign, Condition=sample.info$Condition, Lane=sample.info$Lane)
+rownames(MDS_data2) <- NULL
+
+# MDS Plot with colored DPC
+
+ggplot(MDS_data2, aes(x=Leading_logFC_dim_1, y=Leading_logFC_dim_2, colour=DPC, shape=Condition))+
+  geom_point(size=3, alpha=0.6)+
+  theme_bw()+
+  labs(title = "MDS plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+
+```
+
+
+```{r, fig.height = 7, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=" Fig. MDS plot excluding the outliers, lane 12 and the inhibitor samples"}
+# MDS Plot with colored DPC lacking the inhibitor and lane 12 samples
+ggplot(filter(MDS_data2, Lane!=12, Condition!="Inhibitor"), aes(x=Leading_logFC_dim_1, y=Leading_logFC_dim_2, colour=DPC, shape=Condition))+
+  geom_point(size=3, alpha=0.6)+
+  theme_bw()+
+  labs(title = "MDS plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+```
+
+
+```{r, fig.height = 7, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap="Fig. MDS plot excluding only the outliers. Colored by condition"}
+
+# MDS Plot with colored Condition - not very useful
+ggplot(MDS_data2, aes(x=Leading_logFC_dim_1, y=Leading_logFC_dim_2, colour=Condition))+
+  geom_point(size=3, alpha=0.6)+
+  theme_bw()+
+  labs(title = "MDS plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+```
+
+### PCA Plots
+
+```{r, fig.height = 7, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap="Fig.PCA plot excluding only the outliers. Colored by DPC"}
+
+global.pseudo <- y$pseudo.counts
+rownames(global.pseudo) <- rownames(y$counts) # this doesn't feel necessary because all(rownames(global.pseudo) == rownames(y$counts))
+pca.results <- prcomp(scale(log(global.pseudo+1), center=T, scale=T)) # It is a good idea to scale your variables. Otherwise the magnitude to certain variables dominates the associations between the variables in the sample.
+
+b <- data.frame(Samples=rownames(pca.results$rotation), 
+                DPC=as.character(sample.info$DPC), 
+                ExperimentalDesign=sample.info$ExperimentalDesign, 
+                Condition=sample.info$Condition,
+                sex.by.rna=ifelse(sex.by.rna==1, "Male", "Female"),
+                rRNA=melt(rRNA)$value,
+                lane=as.factor(sample.info$Lane),
+                pca.results$rotation)
+rownames(b) <- NULL
+
+#PCA plot
+ggplot(b, aes(x=PC1, y=PC2, fill=DPC, shape=Condition))+
+  geom_point(size=3, alpha=0.6, colour="black", pch=21)+
+  theme_bw()+
+  labs(title = "PCA plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+```
+
+
+
+```{r, fig.height = 7, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap="Fig.PCA plot excluding the outliers, lane 12 and the inhibitor samples. Colored by DPC"}
+
+#PCA plot lacking lane 12 and the inhibitor samples
+ggplot(filter(b, lane!=12, Condition!="Inhibitor"), aes(x=PC1, y=PC2, fill=DPC, shape=Condition))+
+  geom_point(size=3, alpha=0.6, colour="black", pch=21)+
+  theme_bw()+
+  labs(title = "PCA plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+```
+
+
+
+```{r, fig.height = 7, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap="Fig.PCA plot excluding the outliers, lane 12 and the inhibitor samples. Colored by DPC"}
+#PCA plot lacking lane 12 and the inhibitor samples - slightly different version
+ggplot(filter(b, lane!=12, Condition!="Inhibitor"), aes(x=PC1, y=PC2, colour=DPC, shape=Condition))+
+  geom_point(size=3, alpha=0.6)+
+  theme_bw()+
+  labs(title = "PCA plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+
+```
+
+
+```{r, fig.height = 7, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap="Fig.PCA plot of E14.5 and E19.5 including the IL6 inhibitor samples. Lane 12 and outlier samples are excluded."}
+
+#PCA of the inhibitor samples
+ggplot(filter(b, lane!=12, DPC %in% c(14.5, 19.5)), aes(x=PC1, y=PC2, colour=Condition, shape=DPC))+
+  geom_point(size=3, alpha=0.6)+
+  theme_bw()+
+  labs(title = "PCA plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+
+#Old version
+#pca.plot.1 <- 1
+#pca.plot.2 <- 2
+#plot(0,xlim=c(min(pca.results$rotation[,pca.plot.1])-.0005, max(pca.results$rotation[,pca.plot.1])+.0005), #ylim=c(min(pca.results$rotation[,pca.plot.2])-.05, max(pca.results$rotation[,pca.plot.2]+.05)), ylab="PC2", #xlab="PC1")
+#text(pca.results$rotation[,pca.plot.1], pca.results$rotation[,pca.plot.2], paste(dpc, group, lane, outlier, sep="_"), #cex=.7)
+```
+
+### Other miscellaneous PCA plots
+These plots include the lane 12 and the IL6 inhibitor samples
+
+```{r, fig.height = 7, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+#Plots
+
+test.pseudo <- y$pseudo.counts  # This line was missing
+test.dpc <- dpc
+test.sex.by.rna <- sex.by.rna
+test.response <- response
+test.rRNA <- as.numeric(rRNA)
+test.group <- group
+
+control.datapoints <- which(group=="1")
+polyic.datapoints <- which(group=="2")
+pca.results.saline <- prcomp(test.pseudo[,control.datapoints])
+
+# plot PCA
+#pca.plot.1 <- 1
+#pca.plot.2 <- 2
+#plot(0,xlim=c(min(pca.results.saline$rotation[,pca.plot.1])-.02, 
+#              max(pca.results.saline$rotation[,pca.plot.1])+.02), 
+#              ylim=c(min(pca.results.saline$rotation[,pca.plot.2])-.05, #max(pca.results.saline$rotation[,pca.plot.2]+.05)))
+#text(pca.results.saline$rotation[,pca.plot.1], pca.results.saline$rotation[,pca.plot.2], #paste(test.dpc[control.datapoints], test.group[control.datapoints], sep="_"), cex=.8)
+#
+
+PCA_Plot_Condition <- function(x, y){
+ggplot(filter(b, Condition %in% x), aes(x=PC1, y=PC2, fill=DPC, shape=Condition))+
+  geom_point(size=3, alpha=0.6, colour="black", pch=21)+
+  theme_bw()+
+  labs(title = y)+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+}
+
+
+PCA_Plot_Condition("Saline", "PCA of Saline samples")
+PCA_Plot_Condition("PolyIC", "PCA of PolyIC samples")
+PCA_Plot_Condition("Inhibitor", "PCA of IL6 inhibitor samples")
+
+```
+
+#### PCA colored by condition
+```{r, fig.height = 7, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+
+#PCA Colored by condition
+ggplot(b, aes(x=PC1, y=PC2, fill=Condition))+
+  geom_point(size=3, alpha=0.6, colour="black", pch=21)+
+  theme_bw()+
+  labs(title = "PCA plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+```
+
+#### PCA colored by sex
+```{r, fig.height = 7, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+
+#PCA Colored by sex
+ggplot(b, aes(x=PC1, y=PC2, fill=sex.by.rna))+
+  geom_point(size=3, alpha=0.6, colour="black", pch=21)+
+  theme_bw()+
+  labs(title = "PCA plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+```
+
+
+#### PCA colored by rRNA
+```{r, fig.height = 7, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+#PCA Colored by rRNA
+ggplot(b, aes(x=PC1, y=PC2, fill=Condition, size=rRNA))+
+  geom_point(alpha=0.6, colour="black", pch=21)+
+  theme_bw()+
+  labs(title = "PCA plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+```
+
+#### PCA colored by lane
+```{r, fig.height = 7, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+#PCA Colored by lane
+ggplot(b, aes(x=PC1, y=PC2, fill=lane, label=lane))+
+  geom_point(size=3, alpha=0.6, colour="black",pch=21)+
+  geom_text_repel()+
+  theme_bw()+
+  labs(title = "PCA plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+```
+
+
+## Modeling DPC with linear regression
+
+### DPC modeling with all Saline and PolyIC samples
+
+Simple modeling including lane 12 samples and samples with rRNA level >0.01
+
+```{r out.width=c('50%', '50%'), fig.show='hold', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE}
+# Test association to PCA for the first 5 principle components 
+
+#The output of this summary.lm object is awfully formated and I can't figure out how to pass it to something like knitr::kable. 
+#This promisses a solution: https://strengejacke.wordpress.com/2015/03/06/beautiful-tables-for-linear-model-summaries-rstats/  Check this out in your free time. 
+
+control.datapoints <- which(group=="1")
+polyic.datapoints <- which(group=="2")
+
+pca.results <- prcomp(global.pseudo)
+pca.results.saline <- prcomp(global.pseudo[,control.datapoints])
+
+#for (index in 1:5) {
+#print(summary(lm(pca.results.saline$rotation[,index]~ as.numeric(as.character(test.dpc[control.datapoints]))
+#                 +test.sex.by.rna[control.datapoints]
+#                 +test.response[control.datapoints]
+#                 +test.rRNA[control.datapoints])))
+#                }
+
+
+train.data <- data.frame(PCA.1=pca.results$rotation[control.datapoints,1],
+                         PCA.2=pca.results$rotation[control.datapoints,2],
+                         PCA.3=pca.results$rotation[control.datapoints,3],
+                         PCA.4=pca.results$rotation[control.datapoints,4],
+                         PCA.5=pca.results$rotation[control.datapoints,5],
+                         rRNA=as.numeric(rRNA[control.datapoints]),
+                         sex=sex.by.rna[control.datapoints]
+)
+
+predict.data <- data.frame(PCA.1=pca.results$rotation[polyic.datapoints,1],
+                         PCA.2=pca.results$rotation[polyic.datapoints,2],
+                         PCA.3=pca.results$rotation[polyic.datapoints,3],
+                         PCA.4=pca.results$rotation[polyic.datapoints,4],
+                         PCA.5=pca.results$rotation[polyic.datapoints,5],
+                         rRNA=as.numeric(rRNA[polyic.datapoints]),
+                         sex=sex.by.rna[polyic.datapoints]
+)
+
+lm.model <- lm(as.numeric(as.character(dpc[control.datapoints])) ~
+                 PCA.1 + PCA.2 + PCA.3 + PCA.4 + PCA.5 + rRNA + sex
+               , data = train.data
+)
+
+# Predicts DPC from the linear model built on train data.
+predict.saline <- predict(lm.model, newdata = train.data)
+predict.polyic <- predict(lm.model, newdata = predict.data)
+
+
+# I had some trouble with the original for loop and I replaced it with lapply. I also added the sd values and a plot representing modeled DPC values.
+dpc.predict.mean.saline <- lapply(1:4, function(x) FUN=mean(predict.saline[which(as.character(dpc[control.datapoints])==unique(dpc)[x])]))
+
+dpc.predict.sd.saline <- lapply(1:4, function(x) FUN=sd(predict.saline[which(as.character(dpc[control.datapoints])==unique(dpc)[x])]))
+
+dpc.predict.mean.polyic <- lapply(1:4, function(x) FUN=mean(predict.polyic[which(as.character(dpc[polyic.datapoints])==unique(dpc)[x])]))
+
+dpc.predict.sd.polyic <- lapply(1:4, function(x) FUN=sd(predict.polyic[which(as.character(dpc[polyic.datapoints])==unique(dpc)[x])]))
+
+dpc.predict.mean.saline <- as.numeric(dpc.predict.mean.saline)
+dpc.predict.sd.saline <- as.numeric(dpc.predict.sd.saline)
+dpc.predict.mean.polyic <- as.numeric(dpc.predict.mean.polyic)
+dpc.predict.sd.polyic <- as.numeric(dpc.predict.sd.polyic)
+
+lm.predicted.dpc <- data.frame(dpc.predict.mean.saline, dpc.predict.sd.saline, dpc.predict.mean.polyic, dpc.predict.sd.polyic)
+
+
+predicted_DPC <- ggplot(lm.predicted.dpc, aes(x=dpc.predict.mean.saline, y=dpc.predict.mean.polyic))+
+  geom_point(size=3, alpha=0.6, colour="red")+
+  geom_abline(intercept = 0, slope = 1)+
+  geom_errorbarh(aes(xmin = dpc.predict.mean.saline-dpc.predict.sd.saline,xmax = dpc.predict.mean.saline+dpc.predict.sd.saline)) + 
+  geom_errorbar(aes(ymin = dpc.predict.mean.polyic-dpc.predict.sd.polyic,ymax = dpc.predict.mean.polyic+dpc.predict.sd.polyic))+
+  scale_x_continuous(breaks=c(12.5, 13.5, 14.5, 15.5, 16.5, 17.5, 18.5, 19.5))+
+  scale_y_continuous(breaks=c(12.5, 13.5, 14.5, 15.5, 16.5, 17.5, 18.5, 19.5))+
+  geom_point(aes(x=c(12.5,14.5,17.5,19.5), y=c(12.5,14.5,17.5,19.5)), colour="darkgreen", size=3)+
+  theme_bw()+
+  labs(title="Predicted saline vs predicted PolyIC DPC", subtitle = "All libraries in saline and PolyIC groups were used for modeling. Green points represent real DPC. Error bars represent SD")
+
+# Repeat this modeling excluidng the outliers. The modeling seemed to fail to estimate DPC in E17.5 Saline.
+
+
+```
+
+```{r out.width=c('50%', '50%'), fig.show='hold', fig.height = 7, fig.width = 14, error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE}
+predicted_DPC
+
+#Alex's DPC plot
+dpc.mean <- c(12.5, 14.5, 17.5, 19.5)
+plot(predict.saline, jitter(as.numeric(as.character(dpc[control.datapoints])), factor=.5), pch=16, xlab="Predicted DPC", ylab="Actual DPC")
+points(predict.polyic, jitter(as.numeric(as.character(dpc[polyic.datapoints])), factor=.5), pch=16, col="red")
+lines(dpc.predict.mean.saline, dpc.mean, col="black")
+lines(dpc.predict.mean.polyic, dpc.mean, col="red")
+legend("topleft", pch=16, col=c("black", "red"), legend=c("Saline", "Poly(I:C)"))
+```
+
+```{r, fig.height = 7, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+t.test.12 <- t.test(predict.saline[which(group[control.datapoints]==1 & as.character(dpc[control.datapoints])=="12.5")], predict.polyic[which(group[polyic.datapoints]==2 & as.character(dpc[polyic.datapoints])=="12.5")])
+
+t.test.14 <- t.test(predict.saline[which(group[control.datapoints]==1 & as.character(dpc[control.datapoints])=="14.5")], predict.polyic[which(group[polyic.datapoints]==2 & as.character(dpc[polyic.datapoints])=="14.5")])
+
+t.test.17 <- t.test(predict.saline[which(group[control.datapoints]==1 & as.character(dpc[control.datapoints])=="17.5")], predict.polyic[which(group[polyic.datapoints]==2 & as.character(dpc[polyic.datapoints])=="17.5")])
+
+t.test.19 <- t.test(predict.saline[which(group[control.datapoints]==1 & as.character(dpc[control.datapoints])=="19.5")], predict.polyic[which(group[polyic.datapoints]==2 & as.character(dpc[polyic.datapoints])=="19.5")])
+
+t.test.modeled.DPC.p.val <- data.frame("p-value E12.5"=t.test.12$p.value, "p-value E14.5"=t.test.14$p.value, "p-value E17.5"=t.test.17$p.value, "p-value E19.5"=t.test.19$p.value)
+
+predicted_DPC_df <- melt(data.frame("mean E12.5"=t.test.12$estimate, "mean E14.5"=t.test.14$estimate, "mean E17.5"=t.test.17$estimate, "mean E19.5"=t.test.19$estimate))
+
+t_test_p_value=c(t.test.12$p.value, t.test.14$p.value, t.test.17$p.value, t.test.19$p.value)
+specify_decimal <- function(x, k) trimws(format(round(x, k), nsmall=k))
+
+predicted_DPC_df_nice <- data.frame("Real_DPC"= c(12.5, 14.5, 17.5, 19.5), "Predicted_DPC_Saline"=predicted_DPC_df$value[c(1,3,5,7)], "Predicted_DPC_PolyIC"=predicted_DPC_df$value[c(2,4,6,8)], "t_test_p_value"=specify_decimal(t_test_p_value, 8))
+
+#predicted_DPC_df_nice
+
+knitr::kable(predicted_DPC_df_nice)
+
+```
+
+### DPC modeling with removed lane 12 and high rRNA content samples.
+It somewhat improved the modeling of DPC 17.5. Outliers were previously removed from the dataset.
+```{r out.width=c('50%', '50%'), fig.show='hold', fig.height = 7, fig.width = 14, error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE}
+control.datapoints <- intersect(which(group=="1"),  which(lane != "12"))
+control.datapoints <- intersect(control.datapoints, which(rRNA < 0.01))
+#control.datapoints <- intersect(control.datapoints, which(response == 1)) # keeping only medium responders doesn't preserve enought data
+
+polyic.datapoints <- intersect(which(group=="2"),  which(lane != "12"))
+polyic.datapoints <- intersect(polyic.datapoints,  which(rRNA < 0.01))
+#polyic.datapoints <- intersect(polyic.datapoints, which(response == 1))
+
+use.cols <- c(control.datapoints, polyic.datapoints)
+
+test.dpc <- dpc[use.cols]
+test.sex.by.rna <- sex.by.rna[use.cols]
+test.response <- response[use.cols]
+test.rRNA <- as.numeric(rRNA)[use.cols]
+test.group <- group[use.cols]
+test.lane <- as.numeric(lane)[use.cols]
+test.data <- exp.data[,use.cols]
+
+min.cpm.criteria <- 0.1
+min.cpm <- min.cpm.criteria
+
+#qCML expression modeling
+y <- DGEList(counts=test.data, group=test.group)
+keep <- rowSums(cpm(y)>min.cpm) >=2
+y <- y[keep, , keep.lib.sizes=FALSE]
+## Perform simple exact test on group
+y <- calcNormFactors(y)
+y <- estimateCommonDisp(y)
+y <- estimateTagwiseDisp(y)
+
+#I'm also modeling the data using the glm functionality. It has low impact on the modeling from pseudocounts.
+design <- model.matrix(~test.sex.by.rna+test.dpc+test.lane+test.response+as.numeric(test.group))
+y <- estimateGLMCommonDisp(y,design)
+y <- estimateGLMTrendedDisp(y,design)
+y <- estimateGLMTagwiseDisp(y,design)
+
+test.pseudo <- y$pseudo.counts
+pca.results <- prcomp(test.pseudo)
+
+#PCA dataframe does not contain all samples as the exp.data, so I have to find which datapoints are control and polyic now
+new.control.datapoints <- which(use.cols %in% control.datapoints)
+new.polyic.datapoints <- which(use.cols %in% polyic.datapoints)
+
+train.data <- data.frame(PCA.1=pca.results$rotation[new.control.datapoints,1],
+                         PCA.2=pca.results$rotation[new.control.datapoints,2],
+                         PCA.3=pca.results$rotation[new.control.datapoints,3],
+                         PCA.4=pca.results$rotation[new.control.datapoints,4],
+                         PCA.5=pca.results$rotation[new.control.datapoints,5],
+                         rRNA=as.numeric(rRNA[new.control.datapoints]),
+                         sex=sex.by.rna[new.control.datapoints],
+                         lane=lane[new.control.datapoints],
+                         response=test.response[new.control.datapoints]
+)
+
+predict.data <- data.frame(PCA.1=pca.results$rotation[new.polyic.datapoints,1],
+                         PCA.2=pca.results$rotation[new.polyic.datapoints,2],
+                         PCA.3=pca.results$rotation[new.polyic.datapoints,3],
+                         PCA.4=pca.results$rotation[new.polyic.datapoints,4],
+                         PCA.5=pca.results$rotation[new.polyic.datapoints,5],
+                         rRNA=as.numeric(rRNA[new.polyic.datapoints]),
+                         sex=sex.by.rna[new.polyic.datapoints],
+                         lane=lane[new.polyic.datapoints],
+                         response=test.response[new.polyic.datapoints]
+)
+
+lm.model <- lm(as.numeric(as.character(dpc[control.datapoints])) ~
+                 PCA.1 + PCA.2 + PCA.3 + PCA.4 + PCA.5 + rRNA + sex + as.numeric(lane) + response
+               , data = train.data
+)
+
+
+# Predicts DPC from the linear model built on train data.
+predict.saline <- predict(lm.model, newdata = train.data)
+predict.polyic <- predict(lm.model, newdata = predict.data)
+
+
+# I had some trouble with the original for loop and I replaced it with lapply. I also added the sd values and a plot representing modeled DPC values.
+dpc.predict.mean.saline <- lapply(1:4, function(x) FUN=mean(predict.saline[which(as.character(dpc[control.datapoints])==unique(dpc)[x])]))
+
+dpc.predict.sd.saline <- lapply(1:4, function(x) FUN=sd(predict.saline[which(as.character(dpc[control.datapoints])==unique(dpc)[x])]))
+
+dpc.predict.mean.polyic <- lapply(1:4, function(x) FUN=mean(predict.polyic[which(as.character(dpc[polyic.datapoints])==unique(dpc)[x])]))
+
+dpc.predict.sd.polyic <- lapply(1:4, function(x) FUN=sd(predict.polyic[which(as.character(dpc[polyic.datapoints])==unique(dpc)[x])]))
+
+dpc.predict.mean.saline <- as.numeric(dpc.predict.mean.saline)
+dpc.predict.sd.saline <- as.numeric(dpc.predict.sd.saline)
+dpc.predict.mean.polyic <- as.numeric(dpc.predict.mean.polyic)
+dpc.predict.sd.polyic <- as.numeric(dpc.predict.sd.polyic)
+
+
+lm.predicted.dpc <- data.frame(dpc.predict.mean.saline, dpc.predict.sd.saline, dpc.predict.mean.polyic, dpc.predict.sd.polyic)
+```
+
+```{r out.width=c('50%', '50%'), fig.show='hold', fig.height = 7, fig.width = 14, error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE}
+
+#Plot
+predicted_DPC <- ggplot(lm.predicted.dpc, aes(x=dpc.predict.mean.saline, y=dpc.predict.mean.polyic))+
+  geom_point(size=3, alpha=0.6, colour="red")+
+  geom_abline(intercept = 0, slope = 1)+
+  geom_errorbarh(aes(xmin = dpc.predict.mean.saline-dpc.predict.sd.saline,xmax = dpc.predict.mean.saline+dpc.predict.sd.saline)) + 
+  geom_errorbar(aes(ymin = dpc.predict.mean.polyic-dpc.predict.sd.polyic,ymax = dpc.predict.mean.polyic+dpc.predict.sd.polyic))+
+  scale_x_continuous(breaks=c(12.5, 13.5, 14.5, 15.5, 16.5, 17.5, 18.5, 19.5))+
+  scale_y_continuous(breaks=c(12.5, 13.5, 14.5, 15.5, 16.5, 17.5, 18.5, 19.5))+
+  geom_point(aes(x=c(12.5,14.5,17.5,19.5), y=c(12.5,14.5,17.5,19.5)), colour="darkgreen", size=3)+
+  theme_bw()+
+  labs(title="Predicted saline vs predicted PolyIC DPC", subtitle = "Lane 12, outliers and rRNA >0.01 samples were removed. Green points represent real DPC.")
+
+predicted_DPC
+
+#Alex's plot after lane 12 sample removal
+dpc.mean <- c(12.5, 14.5, 17.5, 19.5)
+
+plot(predict.saline, jitter(as.numeric(as.character(dpc[control.datapoints])), factor=.5), pch=16, xlab="Predicted DPC", ylab="Actual DPC")
+points(predict.polyic, jitter(as.numeric(as.character(dpc[polyic.datapoints])), factor=.5), pch=16, col="red")
+lines(dpc.predict.mean.saline, dpc.mean, col="black")
+lines(dpc.predict.mean.polyic, dpc.mean, col="red")
+legend("topleft", pch=16, col=c("black", "red"), legend=c("Saline", "Poly(I:C)"))
+
+```
+
+```{r, fig.height = 7, fig.width = 14, error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE}
+#Nicer dataframe
+predicted.dpc.df <- data.frame("Real_DPC"=c(12.5, 14.5, 17.5, 19.5), "Predicted_Saline_Mean_DPC"= dpc.predict.mean.saline, "Predicted_Saline_SD_DPC"=dpc.predict.sd.saline, "Predicted_PolyIC_Mean_DPC"= dpc.predict.mean.polyic, "Predicted_PolyIC_SD_DPC"=dpc.predict.sd.polyic)
+
+#knitr::kable(predicted.dpc.df)
+
+
+##### T test ####
+t.test.12 <- t.test(predict.saline[which(group[control.datapoints]==1 & as.character(dpc[control.datapoints])=="12.5")], predict.polyic[which(group[polyic.datapoints]==2 & as.character(dpc[polyic.datapoints])=="12.5")])
+
+t.test.14 <- t.test(predict.saline[which(group[control.datapoints]==1 & as.character(dpc[control.datapoints])=="14.5")], predict.polyic[which(group[polyic.datapoints]==2 & as.character(dpc[polyic.datapoints])=="14.5")])
+
+t.test.17 <- t.test(predict.saline[which(group[control.datapoints]==1 & as.character(dpc[control.datapoints])=="17.5")], predict.polyic[which(group[polyic.datapoints]==2 & as.character(dpc[polyic.datapoints])=="17.5")])
+
+t.test.19 <- t.test(predict.saline[which(group[control.datapoints]==1 & as.character(dpc[control.datapoints])=="19.5")], predict.polyic[which(group[polyic.datapoints]==2 & as.character(dpc[polyic.datapoints])=="19.5")])
+
+t.test.modeled.DPC.p.val <- data.frame("p-value E12.5"=t.test.12$p.value, "p-value E14.5"=t.test.14$p.value, "p-value E17.5"=t.test.17$p.value, "p-value E19.5"=t.test.19$p.value)
+
+predicted_DPC_df <- melt(data.frame("mean E12.5"=t.test.12$estimate, "mean E14.5"=t.test.14$estimate, "mean E17.5"=t.test.17$estimate, "mean E19.5"=t.test.19$estimate))
+
+t_test_p_value=c(t.test.12$p.value, t.test.14$p.value, t.test.17$p.value, t.test.19$p.value)
+specify_decimal <- function(x, k) trimws(format(round(x, k), nsmall=k))
+
+predicted_DPC_df_nice <- data.frame("Real_DPC"= c(12.5, 14.5, 17.5, 19.5), "Predicted_DPC_Saline"=predicted_DPC_df$value[c(1,3,5,7)], "Predicted_DPC_PolyIC"=predicted_DPC_df$value[c(2,4,6,8)], "t_test_p_value"=specify_decimal(t_test_p_value, 8))
+
+#predicted_DPC_df_nice
+
+knitr::kable(predicted_DPC_df_nice)
+
+```
+
+
+
+### DE calculated using GLM method
+All time points are used for calculating DE here. This fragment of the analysis has little biological meaning.
+```{r general GLM, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+#GLM method. Lacking lane 12 and the inhibitor
+
+design <- model.matrix(~test.sex.by.rna+test.dpc+test.lane+as.numeric(test.group))
+y <- DGEList(counts=test.data, group=group[use.cols])
+keep <- rowSums(cpm(y)>min.cpm) >=2 #keeps only genes expressed in above min.cpm in at least 2 libraries in each group 
+y <- y[keep, , keep.lib.sizes=FALSE]
+y <- estimateGLMCommonDisp(y,design)
+y <- estimateGLMTrendedDisp(y,design)
+y <- estimateGLMTagwiseDisp(y,design)
+fit <- glmFit(y,design) 
+lrt <- glmLRT(fit) # Genewise Negative Binomial Generalized Linear Models.
+
+glm.output <- topTags(lrt, n=Inf)
+#write.table(glm.output$table, "DE_Full_PolyIC.txt", sep="\t", col.names=T, row.names=T, quote=F)
+glm.output.full <- glm.output$table
+
+glm.output.full$gene_name <- rownames(glm.output.full)
+rownames <- NULL
+
+#Add a volcano plot here
+
+volcano_plot <- function(x, plot_title) {
+
+significance_threshold <- 0.01
+  
+#This is nicely dealing with datasets with missing cathegories.
+test <- ifelse(x$FDR, "Non significant")
+test <- ifelse(x$FDR <0.01, "FDR < 0.01", test)
+test <- ifelse(x$logFC > 1, "logFC > abs(1)", test)
+test <- ifelse(x$logFC < -1, "logFC > abs(1)", test)
+test <- ifelse(x$logFC > 1 & x$FDR <0.01, "FDR < 0.01 & logFC > abs(1)", test)
+test <- ifelse(x$logFC < -1 & x$FDR <0.01, "FDR < 0.01 & logFC > abs(1)", test)
+
+plotDat <- data.frame(x, Group=test)
+
+ggplot(na.omit(plotDat), aes(x = logFC, y=-log10(PValue), fill=Group, col = Group)) +
+  geom_point(alpha = 0.8, size=2)+
+  theme_light()+
+  scale_fill_manual(values=c("Non significant"="black", "FDR < 0.01"="orange", "logFC > abs(1)"="green", "FDR < 0.01 & logFC > abs(1)"="red"))+
+  scale_color_manual(values=c("Non significant"="black", "FDR < 0.01"="orange", "logFC > abs(1)"="green", "FDR < 0.01 & logFC > abs(1)"="red"))+
+  labs(title= plot_title)+
+  theme(plot.title = element_text(size = rel(2), hjust=0.5))+
+  theme(legend.text=element_text(size=16))+
+  theme(axis.text=element_text(size=14))+
+  theme(legend.title=element_blank())+
+  theme(axis.text=element_text(size=14))+
+  theme(axis.title = element_text(size=14, face = "bold"))+
+  theme(legend.position="bottom")
+}
+
+
+volcano_plot(glm.output.full, "GLM volcano plot")
+
+datatable(glm.output.full)
+
+###############
+
+#geom_text_repel crashes R. Consider regular geom_text.
+volcano_plot_text <- function(x, plot_title) {
+
+significance_threshold <- 0.05
+  
+#This is nicely dealing with datasets with missing cathegories.
+test <- ifelse(x$FDR, "Non significant")
+test <- ifelse(x$FDR <0.01, "FDR < 0.01", test)
+test <- ifelse(x$logFC > 1, "logFC > abs(1)", test)
+test <- ifelse(x$logFC < -1, "logFC > abs(1)", test)
+test <- ifelse(x$logFC > 1 & x$FDR <0.01, "FDR < 0.01 & logFC > abs(1)", test)
+test <- ifelse(x$logFC < -1 & x$FDR <0.01, "FDR < 0.01 & logFC > abs(1)", test)
+
+plotDat <- data.frame(x, Group=test)
+
+p <- ggplot(na.omit(plotDat), aes(x = logFC, y=-log10(PValue), fill=Group, col = Group)) +
+  geom_point(aes(text=gene_name, size=pop), alpha = 0.7, size=1)+
+  theme_light()+
+  scale_fill_manual(values=c("Non significant"="black", "FDR < 0.01"="orange", "logFC > abs(1)"="green", "FDR < 0.01 & logFC > abs(1)"="red"))+
+  scale_color_manual(values=c("Non significant"="black", "FDR < 0.01"="orange", "logFC > abs(1)"="green", "FDR < 0.01 & logFC > abs(1)"="red"))+
+  labs(title= plot_title)+
+  theme(plot.title = element_text(size = rel(2), hjust=0.5))+
+  theme(legend.text=element_text(size=16))+
+  theme(axis.text=element_text(size=14))+
+  theme(legend.title=element_blank())+
+  theme(axis.text=element_text(size=14))+
+  theme(axis.title = element_text(size=14, face = "bold"))+
+  theme(legend.position="bottom")
+
+p
+  
+#ggplotly(p) %>%
+#  layout(legend = list(
+#      orientation = "h",y = -0.1
+#    )
+#  )
+}
+
+volcano_plot_text(glm.output.full, "GLM method volcano plot")
+
+datatable(glm.output.full)
+```
+
+## Single timepoint DE analysis with GLM method
+
+```{r Single timepoint functions, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+#GLM method. Lacking lane 12 and the inhibitor
+
+single_timepoint_glm_function<- function(x){
+
+control.datapoints <- intersect(which(group=="1"),  which(lane != "12"))
+control.datapoints <- intersect(control.datapoints, which(rRNA < 0.01))
+control.datapoints <- intersect(control.datapoints, which(dpc == x))
+#control.datapoints <- intersect(control.datapoints, which(response == 1)) # keeping only medium responders doesn't preserve enought data
+
+polyic.datapoints <- intersect(which(group=="2"),  which(lane != "12"))
+polyic.datapoints <- intersect(polyic.datapoints,  which(rRNA < 0.01))
+polyic.datapoints <- intersect(polyic.datapoints, which(dpc == x))
+#polyic.datapoints <- intersect(polyic.datapoints, which(response == 1))
+
+use.cols <- c(control.datapoints, polyic.datapoints)
+
+test.dpc <- dpc[use.cols]
+test.sex.by.rna <- sex.by.rna[use.cols]
+test.response <- response[use.cols]
+test.rRNA <- as.numeric(rRNA)[use.cols]
+test.group <- group[use.cols]
+test.lane <- as.numeric(lane)[use.cols]
+test.data <- exp.data[,use.cols]
+
+min.cpm.criteria <- 0.1
+min.cpm <- min.cpm.criteria
+
+design <- model.matrix(~test.sex.by.rna+test.lane+as.numeric(test.group))
+y <- DGEList(counts=test.data, group=group[use.cols])
+keep <- rowSums(cpm(y)>min.cpm) >=2 #keeps only genes expressed in above min.cpm in at least 2 libraries in each group 
+y <- y[keep, , keep.lib.sizes=FALSE]
+y <- estimateGLMCommonDisp(y,design)
+y <- estimateGLMTrendedDisp(y,design)
+y <- estimateGLMTagwiseDisp(y,design)
+fit <- glmFit(y,design) 
+lrt <- glmLRT(fit) # Genewise Negative Binomial Generalized Linear Models.
+
+glm.output <- topTags(lrt, n=Inf)
+#write.table(glm.output$table, "DE_Full_PolyIC.txt", sep="\t", col.names=T, row.names=T, quote=F)
+glm.output.full <- glm.output$table
+
+glm.output.full$gene_name <- rownames(glm.output.full)
+rownames(glm.output.full) <- NULL
+glm.output.full <- glm.output.full[,c(6,1:5)]
+
+glm.output.full
+
+#a <- volcano_plot_text(glm.output.full, k)
+
+#list(a, glm.output.full)
+}
+
+```
+
+### E12.5
+```{r E12.5, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+
+E12.5_GLM <- single_timepoint_glm_function(12.5)
+
+p <- volcano_plot_text(E12.5_GLM, "E12.5 GLM DE analysis")
+p+geom_text_repel(aes(label=ifelse(Group=="FDR < 0.01 & logFC > abs(1)", as.character(gene_name),'')))
+
+```
+
+```{r, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+
+datatable(E12.5_GLM, options = list(pageLength = 20, scrollX=T))
+```
+
+### E14.5
+```{r E14.5, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+
+E14.5_GLM <- single_timepoint_glm_function(14.5)
+
+p <- volcano_plot_text(E14.5_GLM, "E14.5 GLM DE analysis")
+p+geom_text_repel(aes(label=ifelse(Group=="FDR < 0.01 & logFC > abs(1)", as.character(gene_name),'')))
+```
+
+```{r, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+
+datatable(E14.5_GLM, options = list(pageLength = 20, scrollX=T))
+```
+
+### E17.5
+```{r E17.5, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+
+E17.5_GLM <- single_timepoint_glm_function(17.5)
+
+p <- volcano_plot_text(E17.5_GLM, "E17.5 GLM DE analysis")
+g <- ggplotly(p)
+g
+```
+
+```{r, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+
+datatable(E17.5_GLM, options = list(pageLength = 20, scrollX=T))
+```
+
+### E19.5
+```{r E19.5, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+
+E19.5_GLM <- single_timepoint_glm_function(19.5)
+
+p <- volcano_plot_text(E19.5_GLM, "E19.5 GLM DE analysis")
+p+geom_text_repel(aes(label=ifelse(Group=="FDR < 0.01 & logFC > abs(1)", as.character(gene_name),'')))
+```
+
+```{r, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+
+datatable(E19.5_GLM, options = list(pageLength = 20, scrollX=T))
+```
+
+## Numbers of DE genes with FDR < 0.05 and logFC > 1 and < -1 
+```{r, r, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+
+E12.5_upregulated <- filter(E12.5_GLM, FDR < 0.05 & logFC > 1)
+E12.5_downregulated <- filter(E12.5_GLM, FDR < 0.05 & logFC < -1)
+
+E14.5_upregulated <- filter(E14.5_GLM, FDR < 0.05 & logFC > 1)
+E14.5_downregulated <- filter(E14.5_GLM, FDR < 0.05 & logFC < -1)
+
+E17.5_upregulated <- filter(E17.5_GLM, FDR < 0.05 & logFC > 1)
+E17.5_downregulated <- filter(E17.5_GLM, FDR < 0.05 & logFC < -1)
+
+E19.5_upregulated <- filter(E19.5_GLM, FDR < 0.05 & logFC > 1)
+E19.5_downregulated <- filter(E19.5_GLM, FDR < 0.05 & logFC < -1)
+
+
+numbers_of_DE_genes <- data.frame("DE_change"=c("Upregulated", "Downregulated"),
+           "E12.5"=c(nrow(E12.5_upregulated), nrow(E12.5_downregulated)),
+           "E14.5"=c(nrow(E14.5_upregulated), nrow(E14.5_downregulated)),
+           "E17.5"=c(nrow(E17.5_upregulated), nrow(E17.5_downregulated)),
+           "E19.5"=c(nrow(E19.5_upregulated), nrow(E19.5_downregulated)))
+
+#rownames(numbers_of_DE_genes) <- c("Upregulated", "Downregulated")
+
+knitr::kable(numbers_of_DE_genes)
+# add a bar plot at some point
+```
+
+##E17.5 and E19.5 significant genes (pvalue<0.05). Search for markers changing in the opposite direction at these two DPCs
+```{r, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+
+Common_DE_genes_in_E17.5_and_E19.5 <- intersect(
+filter(E17.5_GLM, PValue < 0.05)$gene_name,
+filter(E19.5_GLM, PValue < 0.05)$gene_name
+)
+
+a <- filter(E17.5_GLM, gene_name %in% Common_DE_genes_in_E17.5_and_E19.5)
+b <- filter(E19.5_GLM, gene_name %in% Common_DE_genes_in_E17.5_and_E19.5)
+
+colnames(a) <- c("gene_name", paste0("E17.5_", colnames(a)[2:6]))
+colnames(b) <- c("gene_name", paste0("E19.5_", colnames(b)[2:6]))
+
+merged_E17.5_and_E19.5_significant <- merge(a,b, by="gene_name")
+
+merged_E17.5_and_E19.5_significant$logFC_diff <-  merged_E17.5_and_E19.5_significant$E17.5_logFC - merged_E17.5_and_E19.5_significant$E19.5_logFC
+
+d <- merged_E17.5_and_E19.5_significant
+
+k <- ifelse(d$E17.5_logFC < 0 & d$E19.5_logFC > 0, TRUE, FALSE)
+k <- ifelse(d$E17.5_logFC > 0 & d$E19.5_logFC < 0, TRUE, k)
+
+merged_E17.5_and_E19.5_significant$opposite_sign <- k
+
+#data.frame("E17.5_logFC"=merged_E17.5_and_E19.5_significant$E17.5_logFC, "E19.5_logFC" = merged_E17.5_and_E19.5_significant$E19.5_logFC, "opposite_sign"=merged_E17.5_and_E19.5_significant$opposite_sign)
+
+j <- ggplot(merged_E17.5_and_E19.5_significant, aes(x=E17.5_logFC, y=E19.5_logFC, color=opposite_sign, fill=opposite_sign, label=gene_name))+
+  geom_point(alpha=0.4)+
+  theme_bw()
+
+ggplotly(j)
+
+
+datatable(merged_E17.5_and_E19.5_significant, options = list(pageLength = 20, scrollX=T))
+
+```
+
+
+
+##Single timepoint DE analysis with qCML method
+
+```{r, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap="", eval=FALSE}
+
+control.datapoints <- intersect(which(group=="1"),  which(lane != "12"))
+control.datapoints <- intersect(control.datapoints, which(rRNA < 0.01))
+control.datapoints <- intersect(control.datapoints, which(dpc == 12.5))
+#control.datapoints <- intersect(control.datapoints, which(response == 1)) # keeping only medium responders doesn't preserve enought data
+
+polyic.datapoints <- intersect(which(group=="2"),  which(lane != "12"))
+polyic.datapoints <- intersect(polyic.datapoints,  which(rRNA < 0.01))
+polyic.datapoints <- intersect(polyic.datapoints, which(dpc == 12.5))
+#polyic.datapoints <- intersect(polyic.datapoints, which(response == 1))
+
+use.cols <- c(control.datapoints, polyic.datapoints)
+
+test.dpc <- dpc[use.cols]
+test.sex.by.rna <- sex.by.rna[use.cols]
+test.response <- response[use.cols]
+test.rRNA <- as.numeric(rRNA)[use.cols]
+test.group <- group[use.cols]
+test.lane <- as.numeric(lane)[use.cols]
+test.data <- exp.data[,use.cols]
+
+min.cpm.criteria <- 0.1
+min.cpm <- min.cpm.criteria
+
+#qCML expression modeling
+y <- DGEList(counts=test.data, group=test.group)
+keep <- rowSums(cpm(y)>min.cpm) >=2
+y <- y[keep, , keep.lib.sizes=FALSE]
+## Perform simple exact test on group
+y <- calcNormFactors(y)
+y <- estimateCommonDisp(y)
+y <- estimateTagwiseDisp(y)
+et <- exactTest(y)
+DE_table <- topTags(et, n="inf")
+
+DE_table <- DE_table$table
+
+simple_colnames <- paste0(substr(colnames(y$pseudo.counts), 1, 4), "_",
+  ifelse(substr(colnames(y$counts), 6, 6)==1, "Saline", "PolyIC")
+)
+  
+a <- arrange(merge(DE_table, y$counts, by = "row.names", all=TRUE), FDR)
+
+colnames(a) <- c("gene_name", colnames(DE_table), simple_colnames)
+
+
+volcano_plot_text(a, "E12.5 DE Genes")
+```
+
+
+
+
+
